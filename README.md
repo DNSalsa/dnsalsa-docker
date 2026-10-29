@@ -16,6 +16,16 @@ Running Home Assistant OS or Supervised? Use the [DNSalsa app](https://github.co
 
 Change the route later in the dashboard; the connector follows without pairing again. *Pair again* on the page connects it to another hostname or account.
 
+## TrueNAS SCALE
+
+DNSalsa Connector is in the TrueNAS community apps.
+
+1. In the dashboard: create the tunnel with the route to your service, as seen from the connector. An app on the same TrueNAS: `http://host.docker.internal:<port of the app>`, for example `http://host.docker.internal:30041`. Another device: its LAN address.
+2. In TrueNAS: **Apps → Discover Apps**, search for **DNSalsa Connector** and press *Install*. The defaults are fine.
+3. Open the app's **Web UI** (port 30542) or its **Logs** for the code, and enter it in the dashboard under **DNSalsa connector**.
+
+TrueNAS offers updates for the app like for any other. Avoid routing to the TrueNAS web interface itself: anyone on the internet could reach its login page.
+
 ## Home Assistant behind the route
 
 The connector notices when the route leads to Home Assistant and checks whether Home Assistant accepts traffic from the tunnel. If not, the page shows the steps: **Settings → System → Network → HTTP Server → Reverse proxy**, turn on *Trust X-Forwarded-For* and add the trusted proxy. In `configuration.yaml`:
@@ -48,16 +58,6 @@ Update with `docker compose pull && docker compose up -d`. Changes are in [`CHAN
 | `DNSALSA_PORT` | `8099` | Port of the page |
 
 The state (the tunnel token) lives in the `dnsalsa-connector` volume, readable only by the container's user. Remove the volume to forget the pairing.
-
-## For the maintainer
-
-- **New version:** raise `VERSION` and add a line to `CHANGELOG.md`. On the push to `main`, `.github/workflows/publish.yml` runs the tests and publishes `ghcr.io/dnsalsa/connector` with tags `<version>`, `<major.minor>` and `latest`. A push without a new version publishes nothing; *Actions → Publish → Run workflow* publishes the current version again.
-- **GHCR, once:** after the first publish, open the package (organisation *DNSalsa → Packages → connector → Package settings*) and set *Change visibility* to **Public**, otherwise `docker pull` asks for a login.
-- **New cloudflared:** every Monday `.github/workflows/cloudflared.yml` checks for a new release and opens a pull request with the new version, both SHA-256 checksums (checked against Cloudflare's release notes) and a new `VERSION`. Merging it publishes the image. Keep the same cloudflared version in `DNSalsa/dnsalsa` and `DNSalsa/dnsalsa-ha`.
-- **Base image:** `alpine:3.23` in the `Dockerfile`; raise it now and then.
-- **Tests:** `python3 -m unittest discover -s tests` (standard library only). GitHub Actions runs them on every push and pull request, and builds and starts the image.
-- **Run without Docker:** `DNSALSA_DATA=/tmp/d DNSALSA_SERVER=https://staging.dnsalsa.nl python3 app/main.py`, then open http://127.0.0.1:8099.
-- **Pairing API:** `POST /api/pair/start` with `kind: "connector"`, then `/api/pair/poll`; the dashboard claims the code with the route. See the README of `DNSalsa/dnsalsa`.
 
 ## Fonts
 
