@@ -16,16 +16,6 @@ Running Home Assistant OS or Supervised? Use the [DNSalsa app](https://github.co
 
 Change the route later in the dashboard; the connector follows without pairing again. *Pair again* on the page connects it to another hostname or account.
 
-## TrueNAS SCALE
-
-DNSalsa Connector is in the TrueNAS community apps.
-
-1. In the dashboard: create the tunnel with the route to your service, as seen from the connector. An app on the same TrueNAS: `http://host.docker.internal:<port of the app>`, for example `http://host.docker.internal:30041`. Another device: its LAN address.
-2. In TrueNAS: **Apps → Discover Apps**, search for **DNSalsa Connector** and press *Install*. The defaults are fine.
-3. Open the app's **Web UI** (port 30542) or its **Logs** for the code, and enter it in the dashboard under **DNSalsa connector**.
-
-TrueNAS offers updates for the app like for any other. Avoid routing to the TrueNAS web interface itself: anyone on the internet could reach its login page.
-
 ## Home Assistant behind the route
 
 The connector notices when the route leads to Home Assistant and checks whether Home Assistant accepts traffic from the tunnel. If not, the page shows the steps: **Settings → System → Network → HTTP Server → Reverse proxy**, turn on *Trust X-Forwarded-For* and add the trusted proxy. In `configuration.yaml`:
