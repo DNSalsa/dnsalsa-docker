@@ -1,0 +1,82 @@
+# Publishes ghcr.io/dnsalsa/connector (amd64 and arm64), tagged with the version in VERSION (1.0.0),
+# its minor (1.0) and latest. Runs on every push to main, but only publishes a version that isn't on GHCR yet:
+# raising VERSION (by hand, or through the cloudflared pull request) is the release.
+# Run it by hand to publish the current version again (for example after a base image fix).
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/dnsalsa/connector
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Version
+        id: v
+        run: |
+          version=$(tr -d ' \n' < VERSION)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = push ] && docker buildx imagetools inspect "$IMAGE:$version" >/dev/null 2>&1; then
+            echo "$IMAGE:$version already exists; raise VERSION to publish."
+            echo "publish=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.v.outputs.publish == 'yes'
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.v.outputs.publish == 'yes'
+
+      - uses: docker/build-push-action@v6
+        if: steps.v.outputs.publish == 'yes'
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+            ${{ env.IMAGE }}:${{ steps.v.outputs.minor }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.title=DNSalsa connector
+            org.opencontainers.image.description=Put a service in your network online at your own dnsalsa.nl address
+
+      - name: Check both architectures
+        if: steps.v.outputs.publish == 'yes'
+        run: docker buildx imagetools inspect "$IMAGE:${{ steps.v.outputs.version }}"

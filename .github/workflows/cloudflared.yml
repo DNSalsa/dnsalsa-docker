@@ -1,0 +1,96 @@
+# Every Monday: is there a newer cloudflared? Then open a pull request that raises the version, both
+# SHA-256 checksums (checked against the ones Cloudflare lists in the release notes) and VERSION.
+# Merging it is the release: the publish workflow puts the new image on GHCR.
+name: cloudflared update
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'   # Monday 05:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare versions
+        id: v
+        run: |
+          current=$(sed -n 's/^ARG CLOUDFLARED_VERSION=//p' Dockerfile)
+          latest=$(gh api repos/cloudflare/cloudflared/releases/latest --jq .tag_name)
+          echo "current=$current latest=$latest"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ] || [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)" != "$latest" ]; then
+            echo "update=no" >> "$GITHUB_OUTPUT"
+          elif gh pr list --state open --head "cloudflared-$latest" --json number --jq 'length' | grep -qv '^0$'; then
+            echo "A pull request for $latest is already open."; echo "update=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "update=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and check
+        if: steps.v.outputs.update == 'yes'
+        id: sums
+        env:
+          LATEST: ${{ steps.v.outputs.latest }}
+        run: |
+          notes=$(gh api "repos/cloudflare/cloudflared/releases/tags/$LATEST" --jq .body)
+          for a in amd64 arm64; do
+            curl -fsSL -o "cloudflared-linux-$a" "https://github.com/cloudflare/cloudflared/releases/download/$LATEST/cloudflared-linux-$a"
+            sum=$(sha256sum "cloudflared-linux-$a" | cut -d' ' -f1)
+            # Cloudflare lists "cloudflared-linux-amd64: <sha256>" in the release notes; refuse a mismatch.
+            listed=$(printf '%s\n' "$notes" | grep -E "^cloudflared-linux-$a:" | grep -oE '[0-9a-f]{64}' | head -1 || true)
+            if [ -n "$listed" ] && [ "$listed" != "$sum" ]; then echo "Checksum mismatch for $a: $sum vs $listed"; exit 1; fi
+            [ -n "$listed" ] || echo "::warning::No checksum for $a in the release notes; using the downloaded file's."
+            echo "$a=$sum" >> "$GITHUB_OUTPUT"
+          done
+          chmod +x cloudflared-linux-amd64 && ./cloudflared-linux-amd64 --version
+          rm -f cloudflared-linux-amd64 cloudflared-linux-arm64
+
+      # A pull request opened by this workflow doesn't start other workflows, so test the change here first.
+      - name: Test the new version
+        if: steps.v.outputs.update == 'yes'
+        env:
+          LATEST: ${{ steps.v.outputs.latest }}
+          AMD64: ${{ steps.sums.outputs.amd64 }}
+          ARM64: ${{ steps.sums.outputs.arm64 }}
+        run: |
+          sed -i "s/^ARG CLOUDFLARED_VERSION=.*/ARG CLOUDFLARED_VERSION=$LATEST/" Dockerfile
+          sed -i -E "s/(ARCH=amd64; SUM=)[0-9a-f]{64}/\1$AMD64/; s/(ARCH=arm64; SUM=)[0-9a-f]{64}/\1$ARM64/" Dockerfile
+          docker build -t connector:test .
+          docker run --rm --entrypoint /usr/local/bin/cloudflared connector:test --version
+          git checkout -- Dockerfile
+
+      - name: Open pull request
+        if: steps.v.outputs.update == 'yes'
+        env:
+          CURRENT: ${{ steps.v.outputs.current }}
+          LATEST: ${{ steps.v.outputs.latest }}
+          AMD64: ${{ steps.sums.outputs.amd64 }}
+          ARM64: ${{ steps.sums.outputs.arm64 }}
+        run: |
+          sed -i "s/^ARG CLOUDFLARED_VERSION=.*/ARG CLOUDFLARED_VERSION=$LATEST/" Dockerfile
+          sed -i -E "s/(ARCH=amd64; SUM=)[0-9a-f]{64}/\1$AMD64/; s/(ARCH=arm64; SUM=)[0-9a-f]{64}/\1$ARM64/" Dockerfile
+          old=$(tr -d ' \n' < VERSION)
+          new=$(echo "$old" | awk -F. '{print $1"."$2"."$3+1}')
+          echo "$new" > VERSION
+          sed -i "0,/^## /s//## $new\n\n- cloudflared $LATEST.\n\n## /" CHANGELOG.md
+          grep -q "$AMD64" Dockerfile && grep -q "$ARM64" Dockerfile
+          git diff --stat
+          branch="cloudflared-$LATEST"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "$new: cloudflared $LATEST"
+          git push -f origin "$branch"
+          gh pr create --base main --head "$branch" --title "$new: cloudflared $LATEST" \
+            --body "cloudflared $CURRENT → $LATEST ([release notes](https://github.com/cloudflare/cloudflared/releases/tag/$LATEST)). Checksums checked against the release notes. Merging publishes ghcr.io/dnsalsa/connector:$new."

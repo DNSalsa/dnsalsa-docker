@@ -1,0 +1,36 @@
+# DNSalsa connector: puts a service in your network online at your dnsalsa.nl address.
+# Save this file as compose.yaml in an empty folder and run: docker compose up -d
+# Update: docker compose pull && docker compose up -d
+services:
+  dnsalsa-connector:
+    # Tags: latest, a minor (1.0) or an exact version (1.0.0). See CHANGELOG.md.
+    image: ghcr.io/dnsalsa/connector:latest
+    container_name: dnsalsa-connector
+    restart: unless-stopped
+    environment:
+      # Only for Home Assistant behind the route: the address Home Assistant has to trust.
+      # Home Assistant on this machine: this network. On another machine: the LAN IP of this machine.
+      DNSALSA_TRUSTED_PROXY: 172.30.57.0/24
+    extra_hosts:
+      # A service on this machine: use http://host.docker.internal:<port> as the route in the dashboard.
+      - host.docker.internal:host-gateway
+    ports:
+      # The page with the pairing code, only reachable from this machine. On a server without a browser,
+      # use `docker logs dnsalsa-connector`. Removing 127.0.0.1: lets anyone on your network open it.
+      - 127.0.0.1:8099:8099
+    volumes:
+      - dnsalsa-connector:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [dnsalsa-connector]
+
+volumes:
+  dnsalsa-connector:
+
+networks:
+  dnsalsa-connector:
+    ipam:
+      config:
+        - subnet: 172.30.57.0/24

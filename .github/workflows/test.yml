@@ -1,0 +1,40 @@
+# Unit tests, and a real build of the image for amd64 (downloads cloudflared and checks its checksum).
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unit tests
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests -v
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build (amd64)
+        run: docker build -t connector:test .
+      - name: cloudflared runs
+        run: docker run --rm --entrypoint /usr/local/bin/cloudflared connector:test --version
+      - name: The page answers on its port, as a non-root user
+        run: |
+          # point it at nothing, so CI never asks the real dnsalsa.nl for pairing codes
+          docker run -d --name app -p 127.0.0.1:8099:8099 -e DNSALSA_SERVER=http://127.0.0.1:9 connector:test
+          for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8099/status && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8099/status | python3 -c "import json,sys;s=json.load(sys.stdin);print(s);assert s['code'] is None and 'Could not reach' in (s['error'] or '')"
+          test "$(docker exec app id -u)" = 1000
+          docker logs app | tail -5
+          docker rm -f app
