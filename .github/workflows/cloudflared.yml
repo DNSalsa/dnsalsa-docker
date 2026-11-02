@@ -1,11 +1,11 @@
-# Every Monday: is there a newer cloudflared? Then open a pull request that raises the version, both
+# Every day: is there a newer cloudflared? Then open a pull request that raises the version, both
 # SHA-256 checksums (checked against the ones Cloudflare lists in the release notes) and VERSION.
 # Merging it is the release: the publish workflow puts the new image on GHCR.
 name: cloudflared update
 
 on:
   schedule:
-    - cron: '23 5 * * 1'   # Monday 05:23 UTC
+    - cron: '23 5 * * *'   # daily 05:23 UTC: security fixes in cloudflared reach users sooner; merging stays by hand
   workflow_dispatch:
 
 permissions:
@@ -94,3 +94,6 @@ jobs:
           git push -f origin "$branch"
           gh pr create --base main --head "$branch" --title "$new: cloudflared $LATEST" \
             --body "cloudflared $CURRENT → $LATEST ([release notes](https://github.com/cloudflare/cloudflared/releases/tag/$LATEST)). Checksums checked against the release notes. Merging publishes ghcr.io/dnsalsa/connector:$new."
+          # Only the newest update stays open: close pull requests for older cloudflared versions, and drop their branches.
+          gh pr list --state open --json number,headRefName --jq '.[] | select(.headRefName | startswith("cloudflared-")) | select(.headRefName != "'"$branch"'") | .number' \
+            | while read -r n; do gh pr close "$n" --delete-branch --comment "Replaced by #$(gh pr view "$branch" --json number --jq .number) (cloudflared $LATEST)."; done
