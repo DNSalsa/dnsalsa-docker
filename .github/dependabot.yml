@@ -1,0 +1,11 @@
+# Dependabot opens a pull request on Monday when a GitHub Action used in the workflows has a new version.
+# cloudflared has its own workflow (cloudflared.yml), so it isn't in here.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly, day: monday, time: "06:00", timezone: Europe/Amsterdam }
+    groups:
+      actions:
+        patterns: ["*"]
