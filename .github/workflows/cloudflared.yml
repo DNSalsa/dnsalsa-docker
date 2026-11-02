@@ -87,11 +87,17 @@ jobs:
           grep -q "$AMD64" Dockerfile && grep -q "$ARM64" Dockerfile
           git diff --stat
           branch="cloudflared-$LATEST"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
-          git commit -am "$new: cloudflared $LATEST"
-          git push -f origin "$branch"
+          # Commit through GitHub's API, not git: GitHub signs those commits, and main only takes signed commits.
+          # A branch left over from a failed run is made again from main.
+          base=$(git rev-parse HEAD)
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$branch" >/dev/null 2>&1 || true
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/heads/$branch" -f sha="$base" >/dev/null
+          additions=$(for f in Dockerfile VERSION CHANGELOG.md; do jq -n --arg path "$f" --arg contents "$(base64 -w0 "$f")" '{path:$path,contents:$contents}'; done | jq -s -c .)
+          jq -n --arg repo "$GITHUB_REPOSITORY" --arg branch "$branch" --arg oid "$base" --arg msg "$new: cloudflared $LATEST" --argjson additions "$additions" \
+            '{query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {input: {branch: {repositoryNameWithOwner: $repo, branchName: $branch}, expectedHeadOid: $oid,
+                message: {headline: $msg}, fileChanges: {additions: $additions}}}}' \
+            | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid
           gh pr create --base main --head "$branch" --title "$new: cloudflared $LATEST" \
             --body "cloudflared $CURRENT → $LATEST ([release notes](https://github.com/cloudflare/cloudflared/releases/tag/$LATEST)). Checksums checked against the release notes. Merging publishes ghcr.io/dnsalsa/connector:$new."
           # Only the newest update stays open: close pull requests for older cloudflared versions, and drop their branches.
