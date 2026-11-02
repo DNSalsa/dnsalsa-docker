@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- cloudflared 2026.10.7.
+
 ## 1.1.0
 
 - Dynamic DNS without a tunnel, also on a free DNSalsa account. Pair under **Setup → Dynamic DNS → DNSalsa connector** in the dashboard, and the connector keeps your hostname on your home address: it looks up your IPv4 and IPv6 address and sends both to DNSalsa in one update.
