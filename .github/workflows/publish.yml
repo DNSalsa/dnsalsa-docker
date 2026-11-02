@@ -2,11 +2,12 @@
 # its minor (1.0) and latest. Runs on every push to main, but only publishes a version that isn't on GHCR yet:
 # raising VERSION (by hand, or through the cloudflared pull request) is the release.
 # Run it by hand to publish the current version again (for example after a base image fix).
+# A push to dev publishes ghcr.io/dnsalsa/connector:dev every time, for testing before a release; never latest.
 name: Publish
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -43,6 +44,14 @@ jobs:
           version=$(tr -d ' \n' < VERSION)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref }}" = refs/heads/dev ]; then
+            echo "tags=$IMAGE:dev" >> "$GITHUB_OUTPUT"
+            echo "check=dev" >> "$GITHUB_OUTPUT"
+            echo "publish=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'tags<<EOF\n%s\n%s\n%s\nEOF\n' "$IMAGE:$version" "$IMAGE:${version%.*}" "$IMAGE:latest" >> "$GITHUB_OUTPUT"
+          echo "check=$version" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event_name }}" = push ] && docker buildx imagetools inspect "$IMAGE:$version" >/dev/null 2>&1; then
             echo "$IMAGE:$version already exists; raise VERSION to publish."
             echo "publish=no" >> "$GITHUB_OUTPUT"
@@ -66,10 +75,7 @@ jobs:
           pull: true
           push: true
           provenance: false
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
-            ${{ env.IMAGE }}:${{ steps.v.outputs.minor }}
-            ${{ env.IMAGE }}:latest
+          tags: ${{ steps.v.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -79,4 +85,4 @@ jobs:
 
       - name: Check both architectures
         if: steps.v.outputs.publish == 'yes'
-        run: docker buildx imagetools inspect "$IMAGE:${{ steps.v.outputs.version }}"
+        run: docker buildx imagetools inspect "$IMAGE:${{ steps.v.outputs.check }}"

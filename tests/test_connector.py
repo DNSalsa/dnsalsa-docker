@@ -9,6 +9,7 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -169,6 +170,8 @@ class Pairing(unittest.TestCase):
             self.assertEqual(FakeDNSalsa.started[0]['kind'], 'connector', 'DNSalsa needs to know the route comes from the dashboard')
             self.assertTrue(FakeDNSalsa.started[0]['device'].startswith('DNSalsa connector ('))
             self.assertEqual(main.STATE.saved['service'], 'https://192.168.1.10:5001')
+            self.assertEqual(main.STATE.saved['mode'], 'tunnel')
+            self.assertIs(FakeDNSalsa.started[0]['ddns'], True, 'DNSalsa may offer dynamic DNS to this version')
             self.assertIsNone(main.STATE.code, 'the code disappears once paired')
             self.assertEqual(stat.S_IMODE(os.stat(main.STATE_FILE).st_mode), 0o600, 'the tunnel token is only readable by the connector')
             self.assertEqual(main.State()._load()['token'], 'tok-123', 'survives a restart')
@@ -177,6 +180,145 @@ class Pairing(unittest.TestCase):
             del os.environ['DNSALSA_SERVER']
             stop(srv)
             main.STATE.forget()
+
+
+class FakeUpdate(BaseHTTPRequestHandler):
+    """DNSalsa's /api/ip and /api/update."""
+    my_ip = '84.26.113.7'
+    calls = []
+    status = 200
+    extra = {}
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        data = (FakeUpdate.my_ip + '\n').encode()
+        self.send_response(200 if self.path == '/api/ip' else 404)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
+        FakeUpdate.calls.append((self.path, self.headers.get('Authorization'), body))
+        v4 = None if body.get('ipv4') in (None, 'none') else body['ipv4']
+        out = {'hostname': 'jansen.dnsalsa.nl', 'type': 'both', 'ipv4': v4, 'ipv6': None, 'changed': True, **FakeUpdate.extra}
+        if FakeUpdate.status != 200:
+            out = {'error': 'x', 'message': 'nope'}
+        data = json.dumps(out).encode()
+        self.send_response(FakeUpdate.status)
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class DynamicDns(unittest.TestCase):
+    """Without a tunnel the app looks up its addresses per family and sends them in one update call.
+    The test server listens on 127.0.0.1 only, so the IPv6 lookup finds nothing, like a home without IPv6."""
+
+    def setUp(self):
+        self.url, self.srv = serve(FakeUpdate)
+        os.environ['DNSALSA_SERVER'] = self.url
+        for k in ('DNSALSA_IPV4', 'DNSALSA_IPV6', 'DNSALSA_INTERVAL'):
+            os.environ.pop(k, None)
+        try:
+            os.remove(main.PREFS_FILE)
+        except OSError:
+            pass
+        FakeUpdate.calls, FakeUpdate.status, FakeUpdate.extra, FakeUpdate.my_ip = [], 200, {}, '84.26.113.7'
+        main.STATE.forget()
+        main.STATE.save({'mode': 'ddns', 'token': 'dsa_tok', 'hostname': 'jansen.dnsalsa.nl', 'url': 'https://jansen.dnsalsa.nl'})
+
+    def tearDown(self):
+        main.STATE.forget()
+        os.environ.pop('DNSALSA_SERVER', None)
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_sends_only_the_addresses_it_found(self):
+        wait = main.ddns_update()
+        path, auth, body = FakeUpdate.calls[-1]
+        self.assertEqual((path, auth), ('/api/update', 'Bearer dsa_tok'))
+        self.assertEqual(body, {'type': 'both', 'ipv4': '84.26.113.7'}, 'no IPv6 found: not sent at all')
+        self.assertEqual(main.STATE.ddns.records['ipv4'], '84.26.113.7')
+        self.assertIsNone(main.STATE.ddns.error)
+        self.assertGreater(wait, 300, 'default 5 minutes, plus a little')
+
+    def test_an_address_gone_three_times_in_a_row_is_removed(self):
+        for _ in range(main.MISSES_BEFORE_REMOVE - 1):
+            main.ddns_update()
+            self.assertNotIn('ipv6', FakeUpdate.calls[-1][2])
+        main.ddns_update()
+        self.assertEqual(FakeUpdate.calls[-1][2]['ipv6'], 'none')
+
+    def test_switched_off_means_removed_right_away(self):
+        main.save_settings('ipv6=on&interval=60')
+        self.assertEqual(main.ddns_settings(), {'ipv4': False, 'ipv6': True, 'interval': 60})
+        wait = main.ddns_update()
+        self.assertEqual(FakeUpdate.calls[-1][2]['ipv4'], 'none')
+        self.assertLess(wait, 70)
+
+    def test_odd_interval_falls_back(self):
+        main.save_settings('ipv4=on&ipv6=on&interval=7')
+        self.assertEqual(main.ddns_settings()['interval'], main.DEFAULT_INTERVAL)
+
+    def test_private_address_is_not_sent(self):
+        FakeUpdate.my_ip = '192.168.1.20'
+        self.assertIsNone(main.lookup_ip(self.url, main.socket.AF_INET))
+        FakeUpdate.my_ip = 'garbage'
+        self.assertIsNone(main.lookup_ip(self.url, main.socket.AF_INET))
+        FakeUpdate.my_ip = '84.26.113.7'
+        self.assertEqual(main.lookup_ip(self.url, main.socket.AF_INET), '84.26.113.7')
+
+    def test_nothing_found_means_no_call(self):
+        os.environ['DNSALSA_SERVER'] = 'http://127.0.0.1:9'   # nothing listens there: offline
+        main.ddns_update()
+        self.assertEqual(FakeUpdate.calls, [])
+        self.assertIn('Could not find your address', main.STATE.ddns.error)
+
+    def test_rejected_token_asks_to_pair_again(self):
+        FakeUpdate.status = 401
+        main.ddns_update()
+        self.assertIn('Pair again', main.STATE.ddns.error)
+
+    def test_free_account_hears_ipv6_comes_with_remote(self):
+        FakeUpdate.extra = {'ipv6Skipped': 'remote_only'}
+        main.ddns_update()
+        self.assertTrue(main.STATE.ddns.ipv6_remote)
+        self.assertIn('IPv6 comes with Remote', main.render())
+
+    def test_page_has_switches_and_no_tunnel_steps(self):
+        main.ddns_update()
+        page = main.render()
+        self.assertIn('name="ipv4" checked', page)
+        self.assertIn('name="ipv6" checked', page)
+        self.assertIn('<option value="300" selected>', page)
+        self.assertIn('84.26.113.7', page)
+        self.assertNotIn('Trust X-Forwarded-For', page)
+        self.assertIn('port forward', page)
+
+    def test_compose_settings_until_the_page_sets_them(self):
+        os.environ.update({'DNSALSA_IPV6': 'false', 'DNSALSA_INTERVAL': '60'})
+        self.assertEqual(main.ddns_settings(), {'ipv4': True, 'ipv6': False, 'interval': 60})
+        main.save_settings('ipv4=on&ipv6=on&interval=900')
+        self.assertEqual(main.ddns_settings(), {'ipv4': True, 'ipv6': True, 'interval': 900}, 'the page wins')
+        os.environ.pop('DNSALSA_IPV6'); os.environ.pop('DNSALSA_INTERVAL')
+
+    def test_settings_form_from_another_site_is_refused(self):
+        page_url, page_srv = serve(main.Handler)
+        try:
+            import urllib.request
+            req = urllib.request.Request(page_url + '/settings', data=b'interval=60', method='POST', headers={'Origin': 'https://evil.example'})
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(e.exception.code, 403)
+            self.assertEqual(main.ddns_settings()['interval'], main.DEFAULT_INTERVAL)
+        finally:
+            stop(page_srv)
+
+    def test_tunnel_loop_leaves_a_ddns_pairing_alone(self):
+        self.assertEqual(main.mode(main.STATE.saved), 'ddns')
+        self.assertEqual(main.mode({'token': 'old'}), 'tunnel', 'pairings from before 1.3.0 are tunnels')
 
 
 class Page(unittest.TestCase):

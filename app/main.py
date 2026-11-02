@@ -1,30 +1,39 @@
 """DNSalsa connector: a Docker container that puts one of your services online at your dnsalsa.nl address.
 
-Pairs with a DNSalsa account by a short code, then runs cloudflared with the tunnel token DNSalsa
-hands over. Where the traffic goes (the route) is set in the DNSalsa dashboard. Shows its state on a
-small page (port 8099) and in the container log.
+Pairs with a DNSalsa account by a short code. With a tunnel (Remote) it runs cloudflared with the tunnel token
+DNSalsa hands over; where the traffic goes (the route) is set in the DNSalsa dashboard. Without one it keeps a
+dynamic-DNS hostname on the current home address: it looks up its IPv4 and IPv6 address and calls the update API
+itself. Shows its state on a small page (port 8099) and in the container log.
 
 Only the Python standard library: no packages to install or update.
 """
 import base64
 import html
+import http.client
+import ipaddress
 import json
 import os
+import random
 import socket
+import ssl
 import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DATA = os.environ.get('DNSALSA_DATA', '/data')
 STATE_FILE = os.path.join(DATA, 'state.json')
+PREFS_FILE = os.path.join(DATA, 'prefs.json')   # dynamic DNS settings from the page; survive "Pair again"
 PORT = int(os.environ.get('DNSALSA_PORT', '8099'))
 CLOUDFLARED = os.environ.get('DNSALSA_CLOUDFLARED', '/usr/local/bin/cloudflared')
 METRICS = '127.0.0.1:20241'
 # Address Home Assistant sees the tunnel traffic come from, for the reverse proxy steps (see compose.yaml).
 TRUSTED_PROXY = os.environ.get('DNSALSA_TRUSTED_PROXY', '')
+USER_AGENT = 'dnsalsa-connector/1.1'
+MISSES_BEFORE_REMOVE = 3   # lookups in a row without an address before its record goes
 
 
 def log(msg):
@@ -40,7 +49,7 @@ class State:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.saved = self._load()      # {token, hostname, url, service} once paired
+        self.saved = self._load()      # {mode, token, hostname, url, service} once paired; mode 'tunnel' or 'ddns'
         self.code = None               # pairing code shown to the user
         self.code_expires = 0
         self.error = None
@@ -49,6 +58,7 @@ class State:
         self.proxy_ok = None           # reverse proxy setting in Home Assistant (only when is_ha)
         self.connected = False
         self.wake = threading.Event()  # nudges the background loops
+        self.ddns = Ddns()             # dynamic DNS without a tunnel
 
     def _load(self):
         try:
@@ -80,15 +90,63 @@ class State:
             self.service = None
             self.is_ha = False
             self.proxy_ok = None
+            self.ddns = Ddns()
+
+
+def mode(saved):
+    """'tunnel' (Remote, cloudflared) or 'ddns' (only the address records). Pairings from before 1.3.0 are tunnels."""
+    return (saved or {}).get('mode') or 'tunnel'
+
+
+class Ddns:
+    """What the dynamic-DNS loop last saw; read by the page."""
+
+    def __init__(self):
+        self.records = {'ipv4': None, 'ipv6': None}   # as DNSalsa has them now
+        self.found = {'ipv4': None, 'ipv6': None}     # what the last lookup found
+        self.misses = {'ipv4': 0, 'ipv6': 0}          # lookups in a row without an address
+        self.last_ok = None                           # time of the last successful update call
+        self.error = None
+        self.ipv6_remote = False                      # free account: DNSalsa left IPv6 out
+        self.wake = threading.Event()                 # settings changed: update now
 
 
 STATE = State()
 
 
+# Dynamic DNS settings. DNSALSA_IPV4, DNSALSA_IPV6 and DNSALSA_INTERVAL give the starting values; the page
+# overrides them (prefs.json), so a server without a browser can be set up from compose.yaml alone.
+INTERVALS = [(30, '30 seconds'), (60, '1 minute'), (300, '5 minutes'), (900, '15 minutes'), (3600, '1 hour')]
+DEFAULT_INTERVAL = 300
+
+
+def prefs():
+    try:
+        with open(PREFS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _env_bool(name):
+    return os.environ.get(name, 'true').strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def ddns_settings():
+    p = prefs()
+    try:
+        env_interval = int(os.environ.get('DNSALSA_INTERVAL') or DEFAULT_INTERVAL)
+    except ValueError:
+        env_interval = DEFAULT_INTERVAL
+    interval = p.get('interval', env_interval)
+    return {'ipv4': p.get('ipv4', _env_bool('DNSALSA_IPV4')) is not False, 'ipv6': p.get('ipv6', _env_bool('DNSALSA_IPV6')) is not False,
+            'interval': interval if interval in dict(INTERVALS) else DEFAULT_INTERVAL}
+
+
 def http_json(method, url, body=None, headers=None, timeout=15):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={
-        'Content-Type': 'application/json', 'User-Agent': 'dnsalsa-ha/1.0', **(headers or {})})
+        'Content-Type': 'application/json', 'User-Agent': USER_AGENT, **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b'{}')
@@ -113,20 +171,26 @@ def pairing_loop():
             continue
         base = server()
         try:
-            status, r = http_json('POST', f'{base}/api/pair/start', {'device': device_name(), 'kind': 'connector'})
+            status, r = http_json('POST', f'{base}/api/pair/start', {'device': device_name(), 'kind': 'connector', 'ddns': True})
             if status != 200:
                 raise RuntimeError(r.get('message') or f'HTTP {status}')
             with STATE.lock:
                 STATE.code, STATE.code_expires, STATE.error = r['code'], r['expiresAt'] / 1000, None
-            log(f"Pairing code: {r['code']}  In your DNSalsa dashboard: hostname > Setup > Cloudflare Tunnel > DNSalsa connector.")
+            log(f"Pairing code: {r['code']}  In your DNSalsa dashboard: hostname > Setup > Cloudflare Tunnel > DNSalsa connector, "
+                "or Dynamic DNS > DNSalsa connector.")
             secret = r['secret']
             while time.time() < STATE.code_expires and not STATE.saved:
                 time.sleep(3)
                 status, p = http_json('POST', f'{base}/api/pair/poll', {'secret': secret})
                 if status == 200 and p.get('status') == 'paired':
-                    STATE.save({'token': p['token'], 'hostname': p['hostname'], 'url': p['url'], 'service': p.get('service')})
-                    log(f"Paired. {p['url']} will serve {p.get('service') or 'the route set in your dashboard'}")
+                    STATE.save({'mode': p.get('mode') or 'tunnel', 'token': p['token'], 'hostname': p['hostname'], 'url': p['url'],
+                                'service': p.get('service')})
+                    if p.get('mode') == 'ddns':
+                        log(f"Paired. Keeping {p['hostname']} on this home's address")
+                    else:
+                        log(f"Paired. {p['url']} will serve {p.get('service') or 'the route set in your dashboard'}")
                     STATE.wake.set()
+                    STATE.ddns.wake.set()
                     break
                 if status == 410:
                     break
@@ -144,7 +208,7 @@ def tunnel_loop():
     proc = None
     quick_exits = 0
     while True:
-        saved = STATE.saved
+        saved = STATE.saved if mode(STATE.saved) == 'tunnel' else None
         if not saved:
             if proc and proc.poll() is None:
                 proc.terminate()
@@ -179,6 +243,111 @@ def tunnel_loop():
                 quick_exits = 0
         STATE.wake.wait(10 if ok else 3)   # check often until connected, then calmly
         STATE.wake.clear()
+
+
+# ── Dynamic DNS without a tunnel ──
+def _connection(scheme, family):
+    """An http.client connection class that only connects over one address family (like curl -4 / -6)."""
+    base_cls = http.client.HTTPSConnection if scheme == 'https' else http.client.HTTPConnection
+
+    class FamilyConnection(base_cls):
+        def connect(self):
+            err = OSError('no address')
+            for af, kind, proto, _, addr in socket.getaddrinfo(self.host, self.port, family, socket.SOCK_STREAM):
+                sock = socket.socket(af, kind, proto)
+                try:
+                    sock.settimeout(self.timeout)
+                    sock.connect(addr)
+                except OSError as e:
+                    sock.close()
+                    err = e
+                    continue
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host) if scheme == 'https' else sock
+                return
+            raise err
+    return FamilyConnection
+
+
+def lookup_ip(base, family):
+    """Our public address of one family, as DNSalsa's /api/ip sees it, or None (no such address, or offline)."""
+    u = urllib.parse.urlsplit(base)
+    conn = _connection(u.scheme, family)(u.hostname, u.port, timeout=8)
+    try:
+        conn.request('GET', '/api/ip', headers={'User-Agent': USER_AGENT})
+        r = conn.getresponse()
+        text = r.read(100).decode('ascii', 'replace').strip() if r.status == 200 else ''
+    except (OSError, http.client.HTTPException):
+        return None
+    finally:
+        conn.close()
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    # DNSalsa refuses private addresses, and one bad address would block the other family's update too.
+    if ip.version != (4 if family == socket.AF_INET else 6) or not (ip.is_global or os.environ.get('DNSALSA_ALLOW_PRIVATE')):
+        return None
+    return str(ip)
+
+
+def ddns_update():
+    """One round: look up both addresses, send what we found in one call. Returns seconds until the next round."""
+    saved, d = STATE.saved, STATE.ddns
+    settings = ddns_settings()
+    interval = settings['interval'] + random.uniform(1, 5)   # a bit more than the interval: DNSalsa allows one call per 30 s
+    base = server()
+    body = {'type': 'both'}
+    for key, family in (('ipv4', socket.AF_INET), ('ipv6', socket.AF_INET6)):
+        if not settings[key]:
+            body[key] = 'none'        # turned off on this page: that record goes
+            d.found[key], d.misses[key] = None, 0
+            continue
+        ip = lookup_ip(base, family)
+        d.found[key] = ip
+        if ip:
+            d.misses[key] = 0
+            body[key] = ip
+        else:
+            d.misses[key] += 1
+            if d.misses[key] >= MISSES_BEFORE_REMOVE:
+                body[key] = 'none'    # gone for a while (no IPv6 any more, say): don't leave a dead record
+    if len(body) == 1:
+        d.error = 'Could not find your address. Is the internet connection down? Trying again soon.'
+        return min(interval, 60)
+    try:
+        status, r = http_json('POST', f'{base}/api/update', body, headers={'Authorization': f"Bearer {saved['token']}"})
+    except Exception as e:  # noqa: BLE001  network trouble
+        d.error = f'Could not reach DNSalsa: {e}'
+        return min(interval, 60)
+    if status == 200:
+        changed = r.get('changed')
+        d.records = {'ipv4': r.get('ipv4'), 'ipv6': r.get('ipv6')}
+        d.ipv6_remote = r.get('ipv6Skipped') == 'remote_only'
+        d.last_ok, d.error = time.time(), None
+        if changed:
+            log(f"Updated {saved['hostname']}: IPv4 {d.records['ipv4'] or 'none'}, IPv6 {d.records['ipv6'] or 'none'}")
+        return interval
+    if status == 429:
+        return 31 + random.uniform(0, 3)
+    if status == 401:
+        d.error = 'DNSalsa no longer accepts this connector\'s token: you made a new one in the dashboard, or removed the hostname. Press "Pair again".'
+    elif status == 409:
+        d.error = r.get('message') or 'This hostname runs through a tunnel now. Press "Pair again".'
+    else:
+        d.error = r.get('message') or f'DNSalsa answered HTTP {status}.'
+    log(d.error)
+    return interval
+
+
+def ddns_loop():
+    while True:
+        wait = 5
+        if mode(STATE.saved) == 'ddns':
+            wait = ddns_update()
+        d = STATE.ddns
+        d.wake.wait(wait)
+        d.wake.clear()
+
 
 
 # ── Route and the Home Assistant reverse proxy setting ──
@@ -233,7 +402,7 @@ def check_proxy(service=None):
 
 def proxy_loop():
     while True:
-        if STATE.saved:
+        if STATE.saved and mode(STATE.saved) == 'tunnel':
             check_proxy()
         time.sleep(15 if STATE.saved and STATE.service is None else 60)   # soon after pairing, then calmly
 
@@ -298,6 +467,16 @@ button:disabled{opacity:.5;cursor:wait}
 code{font:700 14px var(--mono);background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:4px 8px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.copy{margin-top:6px}.copy button{padding:5px 11px;font-size:13px}
 .check{display:flex;gap:10px;align-items:center}.check svg{flex:none;color:var(--ok)}
+.recs{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;align-items:baseline}.recs dt{font:700 11px/1.9 var(--mono);letter-spacing:.14em;color:var(--muted)}
+.recs dd{font:700 14px var(--mono);word-break:break-all}.recs dd.off{color:var(--muted);font-weight:400;font-family:var(--sans)}
+.set{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line)}.set:first-of-type{border-top:0}
+.set small{display:block;color:var(--muted);font-size:13px}
+.switch{appearance:none;-webkit-appearance:none;flex:none;width:44px;height:26px;border-radius:99px;background:var(--line);position:relative;cursor:pointer;transition:background .15s}
+.switch::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:var(--fg);transition:transform .15s}
+.switch:checked{background:var(--orange)}.switch:checked::after{transform:translateX(18px)}
+.switch:focus-visible,select:focus-visible{outline:2px solid var(--heat);outline-offset:2px}
+select{font:500 14px var(--sans);padding:7px 10px;border-radius:9px;border:1px solid var(--line);background:var(--card2);color:var(--fg)}
+@media(prefers-reduced-motion:reduce){.switch,.switch::after{transition:none}}
 footer{margin-top:6px;text-align:center;font-size:12px;color:var(--muted)}footer a{color:var(--muted)}
 </style></head><body><main>
 <header>__FLAME__<div class="brand">DNS<span>alsa</span> <span class="muted small">connector</span></div>__PILL__</header>
@@ -305,7 +484,9 @@ __BODY__
 <footer><a href="https://dnsalsa.nl" target="_blank" rel="noopener">dnsalsa.nl</a> · <a href="mailto:info@dnsalsa.nl">info@dnsalsa.nl</a></footer>
 </main><script>
 document.querySelectorAll('form[data-post]').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();
-const b=f.querySelector('button');b.disabled=true;await fetch(f.dataset.post,{method:'POST'});location.reload();}));
+const b=f.querySelector('button');if(b)b.disabled=true;await fetch(f.dataset.post,{method:'POST',body:new URLSearchParams(new FormData(f))});location.reload();}));
+// Settings save as soon as you flip a switch or pick an interval.
+document.querySelectorAll('form[data-auto]').forEach(f=>f.addEventListener('change',()=>f.requestSubmit()));
 // Copy also works on plain http:// (no secure context), where navigator.clipboard is missing.
 document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{
 const t=document.getElementById(b.dataset.copy).textContent;let ok=false;
@@ -321,7 +502,60 @@ CHECK = ('<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="cu
          'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>')
 
 
+def ago(t):
+    secs = int(time.time() - t)
+    if secs < 60:
+        return 'just now'
+    mins = secs // 60
+    return f"{mins} minute{'s' if mins != 1 else ''} ago" if mins < 60 else f"{mins // 60} h ago"
+
+
+def render_ddns(saved):
+    """The page without a tunnel: the address records, the settings, and what's still needed for remote access."""
+    d, settings = STATE.ddns, ddns_settings()
+    if d.error:
+        pill = '<span class="pill wait"><i></i>Problem</span>'
+    elif d.last_ok:
+        pill = '<span class="pill ok"><i></i>Updating</span>'
+    else:
+        pill = '<span class="pill wait"><i></i>Starting</span>'
+    parts = []
+    if d.error:
+        parts.append(f'<div class="card warn"><p>{html.escape(d.error)}</p></div>')
+
+    def rec(key, label):
+        if not settings[key]:
+            return f'<dt>{label}</dt><dd class="off">Off</dd>'
+        if d.records[key]:
+            return f'<dt>{label}</dt><dd>{html.escape(d.records[key])}</dd>'
+        why = 'IPv6 comes with Remote' if key == 'ipv6' and d.ipv6_remote else ('none found' if d.last_ok else 'checking…')
+        return f'<dt>{label}</dt><dd class="off">{why}</dd>'
+    when = f'Last update {ago(d.last_ok)}.' if d.last_ok else 'Looking up your address…'
+    host = html.escape(saved['hostname'])
+    parts.append(f'''<div class="card hero"><div class="label">Your address</div><div class="addr">{host}</div>
+<dl class="recs">{rec('ipv4', 'IPV4')}{rec('ipv6', 'IPV6')}</dl>
+<p class="muted small">{when} DNSalsa only changes the record when your address changes.</p></div>''')
+    opts = ''.join(f'<option value="{v}"{" selected" if v == settings["interval"] else ""}>{l}</option>' for v, l in INTERVALS)
+    v6_note = ('<small>Your account gets IPv4 only; IPv6 comes with Remote.</small>' if d.ipv6_remote
+               else '<small>Turning one off removes that record.</small>')
+    parts.append(f'''<div class="card"><h2>Settings</h2><form data-post="settings" data-auto>
+<label class="set"><span>IPv4<small>The A record.</small></span><input class="switch" type="checkbox" name="ipv4"{' checked' if settings['ipv4'] else ''}></label>
+<label class="set"><span>IPv6{v6_note}</span><input class="switch" type="checkbox" name="ipv6"{' checked' if settings['ipv6'] else ''}></label>
+<label class="set"><span>Check every<small>A lookup costs nothing; DNS only changes when your address does.</small></span>
+<select name="interval">{opts}</select></label></form></div>''')
+    parts.append('''<div class="card"><h2>Reaching a service from outside</h2>
+<p class="muted small">This address points at your home. To open a service with it from outside, your router needs a port forward to
+that service. With DNSalsa Remote you need no port forward, and your home IP stays hidden.</p></div>''')
+    parts.append('''<div class="card"><h2>Pair again</h2><p class="muted small">Use another hostname, another DNSalsa account, or Remote.
+This connector stops updating the current address.</p>
+<form class="row" data-post="unpair"><button>Pair again</button></form></div>''')
+    refresh = '' if d.last_ok and not d.error else 'setTimeout(()=>location.reload(),4000);'
+    return PAGE.replace('__PILL__', pill).replace('__BODY__', '\n'.join(parts)).replace('__REFRESH__', refresh)
+
+
 def render():
+    if mode(STATE.saved) == 'ddns' and STATE.saved:
+        return render_ddns(STATE.saved)
     with STATE.lock:
         saved, code, expires, error = STATE.saved, STATE.code, STATE.code_expires, STATE.error
         service, is_ha, proxy_ok, connected = STATE.service, STATE.is_ha, STATE.proxy_ok, STATE.connected
@@ -341,8 +575,10 @@ def render():
             parts.append(f'''<div class="card hero"><div class="label">Pairing code</div>
 <div class="code">{html.escape(code)}</div>
 <ol><li>Open <a href="{base}/dashboard" target="_blank" rel="noopener">your DNSalsa dashboard</a>.</li>
-<li>At the hostname you want, choose <b>Setup → Cloudflare Tunnel</b> and set the route: the service, as seen from this container.</li>
-<li>Choose <b>DNSalsa connector</b> and enter the code above. This page updates by itself.</li></ol>
+<li>Remote access: at the hostname you want, choose <b>Setup → Cloudflare Tunnel</b>, set the route (the service, as seen from
+this container), choose <b>DNSalsa connector</b> and enter the code above.</li>
+<li>Or keep a hostname on your home address: <b>Setup → Dynamic DNS → DNSalsa connector</b>, and enter the code.</li>
+<li>This page updates by itself.</li></ol>
 <p class="muted small">The code works for {mins} more minute{'s' if mins != 1 else ''}; after that you get a new one here.</p></div>''')
         else:
             parts.append('<div class="card"><p class="muted">Getting a pairing code…</p></div>')
@@ -374,6 +610,22 @@ This disconnects the current address from this connector.</p>
     return PAGE.replace('__PILL__', pill).replace('__BODY__', '\n'.join(parts)).replace('__REFRESH__', refresh)
 
 
+def save_settings(form):
+    """The settings form: a ticked switch is sent as 'on', an unticked one not at all."""
+    f = urllib.parse.parse_qs(form)
+    try:
+        interval = int(f.get('interval', [DEFAULT_INTERVAL])[0])
+    except ValueError:
+        interval = DEFAULT_INTERVAL
+    p = {**prefs(), 'ipv4': 'ipv4' in f, 'ipv6': 'ipv6' in f, 'interval': interval if interval in dict(INTERVALS) else DEFAULT_INTERVAL}
+    tmp = PREFS_FILE + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump(p, fh)
+    os.replace(tmp, PREFS_FILE)
+    log(f"Settings: IPv4 {'on' if p['ipv4'] else 'off'}, IPv6 {'on' if p['ipv6'] else 'off'}, every {p['interval']} s")
+    STATE.ddns.wake.set()   # apply now
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -403,7 +655,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.rstrip('/').endswith('status'):
             with STATE.lock:
-                return self._send(200, json.dumps({'paired': bool(STATE.saved), 'code': STATE.code, 'connected': STATE.connected,
+                d = STATE.ddns
+                return self._send(200, json.dumps({'paired': bool(STATE.saved), 'mode': mode(STATE.saved) if STATE.saved else None,
+                                                   'records': d.records, 'lastUpdate': d.last_ok, 'ddnsError': d.error,
+                                                   'code': STATE.code, 'connected': STATE.connected,
                                                    'service': STATE.service, 'homeAssistant': STATE.is_ha,
                                                    'proxyOk': STATE.proxy_ok, 'error': STATE.error}), 'application/json')
         self._send(200, render())
@@ -414,6 +669,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.rstrip('/')
         if path.endswith('check'):
             check_proxy()
+        elif path.endswith('settings'):
+            save_settings(self.rfile.read(min(int(self.headers.get('Content-Length') or 0), 2000)).decode('utf-8', 'replace'))
         elif path.endswith('unpair'):
             STATE.forget()
             log('Unpaired; getting a new pairing code')
@@ -423,7 +680,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DATA, exist_ok=True)
-    for fn in (pairing_loop, tunnel_loop, proxy_loop):
+    for fn in (pairing_loop, tunnel_loop, proxy_loop, ddns_loop):
         threading.Thread(target=fn, daemon=True).start()
     log(f'DNSalsa connector running, server {server()}. Status page on port {PORT}.')
     ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()

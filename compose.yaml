@@ -11,6 +11,10 @@ services:
       # Only for Home Assistant behind the route: the address Home Assistant has to trust.
       # Home Assistant on this machine: this network. On another machine: the LAN IP of this machine.
       DNSALSA_TRUSTED_PROXY: 172.30.57.0/24
+      # Only for dynamic DNS without a tunnel: starting values, the page can change them.
+      # DNSALSA_IPV4: "true"
+      # DNSALSA_IPV6: "true"
+      # DNSALSA_INTERVAL: "300"   # seconds: 30, 60, 300, 900 or 3600
     extra_hosts:
       # A service on this machine: use http://host.docker.internal:<port> as the route in the dashboard.
       - host.docker.internal:host-gateway
