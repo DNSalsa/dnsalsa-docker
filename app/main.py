@@ -573,7 +573,7 @@ def render():
         if code:
             mins = max(1, int((expires - time.time()) / 60))
             parts.append(f'''<div class="card hero"><div class="label">Pairing code</div>
-<div class="code">{html.escape(code)}</div>
+<div class="row"><div class="code" id="pair-code">{html.escape(code)}</div><button type="button" data-copy="pair-code">Copy</button></div>
 <ol><li>Open <a href="{base}/dashboard" target="_blank" rel="noopener">your DNSalsa dashboard</a>.</li>
 <li>For remote access: open the hostname and choose <b>Setup → Cloudflare Tunnel</b>. As the route, enter the address of
 the service you want to reach, the way this container reaches it: <code>http://192.168.1.20:8123</code> for Home Assistant on another
