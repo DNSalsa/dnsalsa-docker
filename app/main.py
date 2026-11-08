@@ -478,23 +478,34 @@ code{font:700 14px var(--mono);background:var(--bg);border:1px solid var(--line)
 select{font:500 14px var(--sans);padding:7px 10px;border-radius:9px;border:1px solid var(--line);background:var(--card2);color:var(--fg)}
 @media(prefers-reduced-motion:reduce){.switch,.switch::after{transition:none}}
 footer{margin-top:6px;text-align:center;font-size:12px;color:var(--muted)}footer a{color:var(--muted)}
-</style></head><body><main>
+</style></head><body><main__REFRESH__>
 <header>__FLAME__<div class="brand">DNS<span>alsa</span> <span class="muted small">connector</span></div>__PILL__</header>
 __BODY__
 <footer><a href="https://dnsalsa.nl" target="_blank" rel="noopener">dnsalsa.nl</a> · <a href="mailto:info@dnsalsa.nl">info@dnsalsa.nl</a></footer>
 </main><script>
-document.querySelectorAll('form[data-post]').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();
-const b=f.querySelector('button');if(b)b.disabled=true;await fetch(f.dataset.post,{method:'POST',body:new URLSearchParams(new FormData(f))});location.reload();}));
+// Refresh by swapping <main> in place instead of reloading the whole page (no flash, and the inline fonts aren't sent
+// along every 4 seconds).
+let tm;
+function schedule(){clearTimeout(tm);if(document.querySelector('main[data-refresh]'))tm=setTimeout(soft,4000)}
+async function soft(){
+try{const r=await fetch(location.href,{cache:'no-store'});if(!r.ok)throw 0;
+const m=new DOMParser().parseFromString(await r.text(),'text/html').querySelector('main');if(!m)throw 0;
+document.querySelector('main').replaceWith(m);bind(m)}catch(e){}
+schedule()}
+function bind(root){
+root.querySelectorAll('form[data-post]').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();
+const b=f.querySelector('button');if(b)b.disabled=true;
+try{await fetch(f.dataset.post,{method:'POST',body:new URLSearchParams(new FormData(f))})}catch(e){}soft()}));
 // Settings save as soon as you flip a switch or pick an interval.
-document.querySelectorAll('form[data-auto]').forEach(f=>f.addEventListener('change',()=>f.requestSubmit()));
+root.querySelectorAll('form[data-auto]').forEach(f=>f.addEventListener('change',()=>f.requestSubmit()));
 // Copy also works on plain http:// (no secure context), where navigator.clipboard is missing.
-document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{
+root.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{
 const t=document.getElementById(b.dataset.copy).textContent;let ok=false;
 try{await navigator.clipboard.writeText(t);ok=true}catch(e){}
 if(!ok){const a=document.createElement('textarea');a.value=t;document.body.append(a);a.select();
 try{ok=document.execCommand('copy')}catch(e){}a.remove()}
-b.textContent=ok?'Copied':'Select and copy';setTimeout(()=>b.textContent='Copy',2000)}));
-__REFRESH__
+b.textContent=ok?'Copied':'Select and copy';setTimeout(()=>b.textContent='Copy',2000)}))}
+bind(document);schedule();
 </script></body></html>"""
 PAGE = PAGE.replace('__SANS__', _font('space-grotesk-latin-wght-normal.woff2')).replace('__MONO__', _font('space-mono-latin-700-normal.woff2')).replace('__FLAME__', FLAME)
 
@@ -549,7 +560,7 @@ that service. With DNSalsa Remote you need no port forward, and your home IP sta
     parts.append('''<div class="card"><h2>Pair again</h2><p class="muted small">Use another hostname, another DNSalsa account, or Remote.
 This connector stops updating the current address.</p>
 <form class="row" data-post="unpair"><button>Pair again</button></form></div>''')
-    refresh = '' if d.last_ok and not d.error else 'setTimeout(()=>location.reload(),4000);'
+    refresh = '' if d.last_ok and not d.error else ' data-refresh'
     return PAGE.replace('__PILL__', pill).replace('__BODY__', '\n'.join(parts)).replace('__REFRESH__', refresh)
 
 
@@ -608,7 +619,7 @@ the code above.</li>
         parts.append('''<div class="card"><h2>Pair again</h2><p class="muted small">Use another hostname or another DNSalsa account.
 This disconnects the current address from this connector.</p>
 <form class="row" data-post="unpair"><button>Pair again</button></form></div>''')
-    refresh = '' if (saved and connected and (proxy_ok or not is_ha)) else 'setTimeout(()=>location.reload(),4000);'
+    refresh = '' if (saved and connected and (proxy_ok or not is_ha)) else ' data-refresh'
     return PAGE.replace('__PILL__', pill).replace('__BODY__', '\n'.join(parts)).replace('__REFRESH__', refresh)
 
 
