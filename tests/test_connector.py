@@ -346,7 +346,7 @@ class Page(unittest.TestCase):
         page = main.render()
         self.assertIn('https://192.168.1.10:5001', page)
         self.assertNotIn('Trust X-Forwarded-For', page)
-        self.assertNotIn('setTimeout(()=>location.reload()', page, 'no auto-refresh once connected')
+        self.assertNotIn('<main data-refresh>', page, 'no auto-refresh once connected')
 
     def test_home_assistant_steps_until_it_works(self):
         main.TRUSTED_PROXY = '172.30.57.0/24'
