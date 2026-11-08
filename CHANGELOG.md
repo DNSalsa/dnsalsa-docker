@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.2
+
+- Clearer pairing steps: step 2 explains what the route is, with an example for a service on another machine and one on this machine.
+
 ## 1.1.1
 
 - cloudflared 2026.10.7.

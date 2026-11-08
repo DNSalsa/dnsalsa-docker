@@ -575,8 +575,10 @@ def render():
             parts.append(f'''<div class="card hero"><div class="label">Pairing code</div>
 <div class="code">{html.escape(code)}</div>
 <ol><li>Open <a href="{base}/dashboard" target="_blank" rel="noopener">your DNSalsa dashboard</a>.</li>
-<li>Remote access: at the hostname you want, choose <b>Setup → Cloudflare Tunnel</b>, set the route (the service, as seen from
-this container), choose <b>DNSalsa connector</b> and enter the code above.</li>
+<li>For remote access: open the hostname and choose <b>Setup → Cloudflare Tunnel</b>. As the route, enter the address of
+the service you want to reach, the way this container reaches it: <code>http://192.168.1.20:8123</code> for Home Assistant on another
+machine, <code>http://host.docker.internal:8123</code> for a service on this machine. Then choose <b>DNSalsa connector</b> and enter
+the code above.</li>
 <li>Or keep a hostname on your home address: <b>Setup → Dynamic DNS → DNSalsa connector</b>, and enter the code.</li>
 <li>This page updates by itself.</li></ol>
 <p class="muted small">The code works for {mins} more minute{'s' if mins != 1 else ''}; after that you get a new one here.</p></div>''')
