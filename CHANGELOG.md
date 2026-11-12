@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.5
+
+- cloudflared 2026.11.0.
+
 ## 1.1.4
 
 - While it waits for pairing, the page updates in place instead of reloading every 4 seconds: no flash, and much less data.
