@@ -370,18 +370,98 @@ class Page(unittest.TestCase):
 class Requests(unittest.TestCase):
     def stub(self, method, headers):
         sent = []
-        return types.SimpleNamespace(command=method, headers=headers, send_error=lambda c: sent.append(c)), sent
+        return types.SimpleNamespace(command=method, headers=headers, send_error=lambda c: sent.append(c),
+                                     _host=lambda: main.Handler._host(types.SimpleNamespace(headers=headers))), sent
 
-    def test_page_open_to_anyone_who_reaches_the_port(self):
-        s, _ = self.stub('GET', {'Host': '192.168.1.5:8099'})
-        self.assertTrue(main.Handler._allowed(s))
+    def tearDown(self):
+        main.PASSWORD = ''
+
+    def test_only_localhost_is_trusted_without_a_password(self):
+        for host in ('127.0.0.1:8099', 'localhost:8099', '[::1]:8099', 'localhost'):
+            s, _ = self.stub('GET', {'Host': host})
+            self.assertTrue(main.Handler._trusted(s), host)
+        for host in ('192.168.1.5:8099', 'evil.example:8099', 'truenas.local', ''):
+            s, _ = self.stub('GET', {'Host': host})
+            self.assertFalse(main.Handler._trusted(s), f'{host}: LAN or DNS rebinding')
+
+    def test_password_lets_any_host_in_with_the_right_one(self):
+        import base64
+        main.PASSWORD = 'salsa-verde'
+        good = 'Basic ' + base64.b64encode(b'any:salsa-verde').decode()
+        bad = 'Basic ' + base64.b64encode(b'any:wrong').decode()
+        s, _ = self.stub('GET', {'Host': '192.168.1.5:8099', 'Authorization': good})
+        self.assertTrue(main.Handler._trusted(s))
+        for auth in (bad, 'Basic !!!', 'Bearer x', None):
+            s, _ = self.stub('GET', {'Host': '127.0.0.1:8099', **({'Authorization': auth} if auth else {})})
+            self.assertFalse(main.Handler._trusted(s), f'{auth}: localhost alone is not enough once a password is set')
 
     def test_another_site_cannot_unpair(self):
-        s, sent = self.stub('POST', {'Host': '127.0.0.1:8099', 'Origin': 'https://evil.example'})
+        s, sent = self.stub('POST', {'Host': '127.0.0.1:8099', 'Origin': 'https://evil.example', 'X-DNSalsa': '1'})
         self.assertFalse(main.Handler._allowed(s))
         self.assertEqual(sent, [403])
-        s, _ = self.stub('POST', {'Host': '127.0.0.1:8099', 'Origin': 'http://127.0.0.1:8099'})
+        s, sent = self.stub('POST', {'Host': '127.0.0.1:8099', 'Origin': 'http://127.0.0.1:8099'})
+        self.assertFalse(main.Handler._allowed(s), 'a plain form post lacks the header the page sends')
+        s, _ = self.stub('POST', {'Host': '127.0.0.1:8099', 'Origin': 'http://127.0.0.1:8099', 'X-DNSalsa': '1'})
         self.assertTrue(main.Handler._allowed(s))
+
+
+class LanPage(unittest.TestCase):
+    """The page as someone on the network sees it: no code, no buttons."""
+
+    def setUp(self):
+        with main.STATE.lock:
+            main.STATE.code, main.STATE.code_expires = 'K7QP-4XM2', time.time() + 600
+        self.url, self.srv = serve(main.Handler)
+
+    def tearDown(self):
+        stop(self.srv)
+        main.PASSWORD = ''
+        with main.STATE.lock:
+            main.STATE.code = None
+
+    def get(self, path, host, headers=None):
+        import urllib.request
+        req = urllib.request.Request(self.url + path, headers={'Host': host, **(headers or {})})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode(), r.headers
+
+    def test_lan_and_rebinding_get_no_code(self):
+        for host in ('192.168.1.5:8099', 'evil.example:8099'):
+            _, page, headers = self.get('/', host)
+            self.assertNotIn('K7QP-4XM2', page)
+            self.assertIn('docker logs dnsalsa-connector', page)
+            self.assertNotIn('<form', page, 'no buttons')
+            self.assertEqual(headers['X-Frame-Options'], 'DENY')
+            _, status, _ = self.get('/status', host)
+            self.assertIsNone(json.loads(status)['code'], 'the healthcheck answer has no code either')
+        _, page, _ = self.get('/', '127.0.0.1:8099')
+        self.assertIn('K7QP-4XM2', page)
+
+    def test_lan_cannot_unpair(self):
+        import urllib.request
+        main.STATE.save({'mode': 'ddns', 'token': 't', 'hostname': 'a.dnsalsa.nl', 'url': 'https://a.dnsalsa.nl'})
+        try:
+            req = urllib.request.Request(self.url + '/unpair', data=b'', method='POST',
+                                         headers={'Host': '192.168.1.5:8099', 'X-DNSalsa': '1'})
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(e.exception.code, 403)
+            self.assertTrue(main.STATE.saved)
+        finally:
+            main.STATE.forget()
+
+    def test_password_asks_for_login(self):
+        import base64
+        main.PASSWORD = 'salsa-verde'
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.get('/', '192.168.1.5:8099')
+        self.assertEqual(e.exception.code, 401)
+        self.assertIn('Basic', e.exception.headers['WWW-Authenticate'])
+        auth = 'Basic ' + base64.b64encode(b'x:salsa-verde').decode()
+        _, page, _ = self.get('/', '192.168.1.5:8099', {'Authorization': auth})
+        self.assertIn('K7QP-4XM2', page)
+        _, status, _ = self.get('/status', '192.168.1.5:8099')
+        self.assertIsNone(json.loads(status)['code'])
 
 
 class Release(unittest.TestCase):

@@ -8,6 +8,7 @@ itself. Shows its state on a small page (port 8099) and in the container log.
 Only the Python standard library: no packages to install or update.
 """
 import base64
+import hmac
 import html
 import http.client
 import ipaddress
@@ -32,7 +33,15 @@ CLOUDFLARED = os.environ.get('DNSALSA_CLOUDFLARED', '/usr/local/bin/cloudflared'
 METRICS = '127.0.0.1:20241'
 # Address Home Assistant sees the tunnel traffic come from, for the reverse proxy steps (see compose.yaml).
 TRUSTED_PROXY = os.environ.get('DNSALSA_TRUSTED_PROXY', '')
-USER_AGENT = 'dnsalsa-connector/1.1'
+USER_AGENT = 'dnsalsa-connector/1.2'
+# The page shows the pairing code, and whoever enters that code in their own DNSalsa account decides where this
+# connector's tunnel leads. So the code and the buttons only show to someone this machine trusts:
+#   DNSALSA_PASSWORD set: anyone who logs in with it (any username), from any address.
+#   Not set: only requests for localhost or a name in DNSALSA_HOSTS. The Host check stops DNS rebinding, where a
+#   website points its own name at 127.0.0.1 to read this page.
+# Everyone else sees a page without the code, and finds the code in the container log.
+PASSWORD = os.environ.get('DNSALSA_PASSWORD', '')
+LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1'} | {h.strip().lower() for h in os.environ.get('DNSALSA_HOSTS', '').split(',') if h.strip()}
 MISSES_BEFORE_REMOVE = 3   # lookups in a row without an address before its record goes
 
 
@@ -495,7 +504,7 @@ schedule()}
 function bind(root){
 root.querySelectorAll('form[data-post]').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();
 const b=f.querySelector('button');if(b)b.disabled=true;
-try{await fetch(f.dataset.post,{method:'POST',body:new URLSearchParams(new FormData(f))})}catch(e){}soft()}));
+try{await fetch(f.dataset.post,{method:'POST',headers:{'X-DNSalsa':'1'},body:new URLSearchParams(new FormData(f))})}catch(e){}soft()}));
 // Settings save as soon as you flip a switch or pick an interval.
 root.querySelectorAll('form[data-auto]').forEach(f=>f.addEventListener('change',()=>f.requestSubmit()));
 // Copy also works on plain http:// (no secure context), where navigator.clipboard is missing.
@@ -623,6 +632,24 @@ This disconnects the current address from this connector.</p>
     return PAGE.replace('__PILL__', pill).replace('__BODY__', '\n'.join(parts)).replace('__REFRESH__', refresh)
 
 
+def render_locked():
+    """For someone this connector doesn't trust (see PASSWORD): the state, but no pairing code and no buttons."""
+    with STATE.lock:
+        saved, connected = STATE.saved, STATE.connected
+    if not saved:
+        pill = '<span class="pill"><i></i>Not paired</span>'
+    elif connected or mode(saved) == 'ddns':
+        pill = '<span class="pill ok"><i></i>Paired</span>'
+    else:
+        pill = '<span class="pill wait"><i></i>Connecting</span>'
+    body = '''<div class="card"><h2>Pairing code in the log</h2>
+<p>This page is open on your network, so it doesn't show the pairing code: anyone who enters that code in their own
+DNSalsa account decides where this connector sends traffic.</p>
+<ol><li>Find the code in the container log: <code>docker logs dnsalsa-connector</code>, or the app's logs in TrueNAS.</li>
+<li>Or set <code>DNSALSA_PASSWORD</code> for this container to use this page from your network.</li></ol></div>'''
+    return PAGE.replace('__PILL__', pill).replace('__BODY__', body).replace('__REFRESH__', ' data-refresh')
+
+
 def save_settings(form):
     """The settings form: a ticked switch is sent as 'on', an unticked one not at all."""
     f = urllib.parse.parse_qs(form)
@@ -643,13 +670,38 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _host(self):
+        h = (self.headers.get('Host') or '').strip().lower()
+        if h.startswith('['):
+            return h[1:h.find(']')] if ']' in h else h
+        return h.rsplit(':', 1)[0] if h.count(':') == 1 else h
+
+    def _trusted(self):
+        """Who may see the pairing code and press the buttons; see PASSWORD."""
+        if PASSWORD:
+            auth = self.headers.get('Authorization') or ''
+            if not auth.startswith('Basic '):
+                return False
+            try:
+                given = base64.b64decode(auth[6:], validate=True).decode('utf-8').split(':', 1)[1]
+            except Exception:  # noqa: BLE001  malformed header: not logged in
+                return False
+            return hmac.compare_digest(given.encode(), PASSWORD.encode())
+        return self._host() in LOCAL_HOSTS
+
+    def _ask_login(self):
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="DNSalsa connector", charset="UTF-8"')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def _allowed(self):
-        """Docker's port mapping decides who reaches this page; compose.yaml binds it to 127.0.0.1.
-        Pairing and unpairing are POSTs, so a page on another site can't trigger them without this check."""
+        """POSTs change things (unpair, settings): only from this page, never from another site. The X-DNSalsa header
+        can't be sent cross-site without a CORS preflight, which this server never answers."""
         if self.command == 'POST':
             origin = self.headers.get('Origin')
             host = self.headers.get('Host', '')
-            if origin and origin.split('://', 1)[-1] != host:
+            if (origin and origin.split('://', 1)[-1] != host) or self.headers.get('X-DNSalsa') != '1':
                 self.send_error(403)
                 return False
         return True
@@ -660,23 +712,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Frame-Options', 'DENY')   # no clickjacking the Pair again button
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
-        if not self._allowed():
-            return
+        trusted = self._trusted()
         if self.path.rstrip('/').endswith('status'):
+            # The healthcheck uses this too, so it answers without login; the code only goes to someone trusted.
             with STATE.lock:
                 d = STATE.ddns
                 return self._send(200, json.dumps({'paired': bool(STATE.saved), 'mode': mode(STATE.saved) if STATE.saved else None,
                                                    'records': d.records, 'lastUpdate': d.last_ok, 'ddnsError': d.error,
-                                                   'code': STATE.code, 'connected': STATE.connected,
+                                                   'code': STATE.code if trusted else None, 'connected': STATE.connected,
                                                    'service': STATE.service, 'homeAssistant': STATE.is_ha,
                                                    'proxyOk': STATE.proxy_ok, 'error': STATE.error}), 'application/json')
-        self._send(200, render())
+        if trusted:
+            return self._send(200, render())
+        if PASSWORD:
+            return self._ask_login()
+        self._send(200, render_locked())
 
     def do_POST(self):
+        if not self._trusted():
+            return self._ask_login() if PASSWORD else self.send_error(403)
         if not self._allowed():
             return
         path = self.path.rstrip('/')

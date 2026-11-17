@@ -67,6 +67,10 @@ Update with `docker compose pull && docker compose up -d`. Changes are in [`CHAN
 | `DNSALSA_TRUSTED_PROXY` | empty | Address shown in the Home Assistant steps |
 | `DNSALSA_NAME` | container hostname | Name shown in the dashboard when you enter the code |
 | `DNSALSA_PORT` | `8099` | Port of the page |
+| `DNSALSA_PASSWORD` | empty | Password for the page (any username). Set it when the page is reachable from your network, like the TrueNAS app |
+| `DNSALSA_HOSTS` | empty | Extra names the page answers to without a password, comma-separated (`localhost` and `127.0.0.1` always work) |
+
+Whoever enters the pairing code in their own DNSalsa account decides where this connector sends traffic, so the page only shows the code and the buttons to someone this machine trusts: with `DNSALSA_PASSWORD`, anyone who logs in; without it, only a browser on this machine (`http://127.0.0.1:8099`). Opened from elsewhere on your network, the page shows the state and points to the code in the container log.
 
 The state (the tunnel token) lives in the `dnsalsa-connector` volume, readable only by the container's user. Remove the volume to forget the pairing.
 

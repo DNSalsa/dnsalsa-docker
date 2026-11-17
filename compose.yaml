@@ -15,12 +15,15 @@ services:
       # DNSALSA_IPV4: "true"
       # DNSALSA_IPV6: "true"
       # DNSALSA_INTERVAL: "300"   # seconds: 30, 60, 300, 900 or 3600
+      # Only when you open the page from other machines (see ports below): a password for it.
+      # DNSALSA_PASSWORD: "choose-a-long-one"
     extra_hosts:
       # A service on this machine: use http://host.docker.internal:<port> as the route in the dashboard.
       - host.docker.internal:host-gateway
     ports:
       # The page with the pairing code, only reachable from this machine. On a server without a browser,
-      # use `docker logs dnsalsa-connector`. Removing 127.0.0.1: lets anyone on your network open it.
+      # use `docker logs dnsalsa-connector`. Without 127.0.0.1: the page opens on your network too, but it only shows
+      # the code there with DNSALSA_PASSWORD set.
       - 127.0.0.1:8099:8099
     volumes:
       - dnsalsa-connector:/data

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0
+
+- Security: the page only shows the pairing code and the buttons to someone this machine trusts. Whoever enters that code in their own DNSalsa account decides where the connector sends traffic, so a code seen by someone else on your network could open your network to them.
+  - New `DNSALSA_PASSWORD`: with it, the page asks for that password (any username) and works from any address. Set it when the page is reachable from your network, as in the TrueNAS app.
+  - Without a password, only `localhost` and `127.0.0.1` (plus names in `DNSALSA_HOSTS`) get the code. Others see the state and a pointer to the container log, which still shows the code.
+  - The page refuses requests for other host names, which stops DNS rebinding from a website, and buttons need a header that other sites can't send. The page can't be framed.
+
 ## 1.1.5
 
 - cloudflared 2026.11.0.
