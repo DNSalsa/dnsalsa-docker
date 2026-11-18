@@ -19,6 +19,8 @@ RUN apk add --no-cache python3 ca-certificates curl \
  && echo "${SUM}  /usr/local/bin/cloudflared" | sha256sum -c - \
  && chmod +x /usr/local/bin/cloudflared \
  && apk del curl \
+ && printf '#!/bin/sh\nexec python3 /app/main.py "$@"\n' > /usr/local/bin/dnsalsa \
+ && chmod +x /usr/local/bin/dnsalsa \
  && adduser -D -H -u 1000 dnsalsa \
  && mkdir /data && chown dnsalsa:dnsalsa /data
 

@@ -15,9 +15,11 @@ import ipaddress
 import json
 import os
 import random
+import secrets
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -36,11 +38,18 @@ TRUSTED_PROXY = os.environ.get('DNSALSA_TRUSTED_PROXY', '')
 USER_AGENT = 'dnsalsa-connector/1.2'
 # The page shows the pairing code, and whoever enters that code in their own DNSalsa account decides where this
 # connector's tunnel leads. So the code and the buttons only show to someone this machine trusts:
-#   DNSALSA_PASSWORD set: anyone who logs in with it (any username), from any address.
+#   DNSALSA_PASSWORD set: anyone who logs in with it on the page, from any address.
 #   Not set: only requests for localhost or a name in DNSALSA_HOSTS. The Host check stops DNS rebinding, where a
 #   website points its own name at 127.0.0.1 to read this page.
-# Everyone else sees a page without the code, and finds the code in the container log.
+# Everyone else sees a page without the code, and gets it with `dnsalsa code` in the container's shell, or the log.
 PASSWORD = os.environ.get('DNSALSA_PASSWORD', '')
+SESSION_TTL = 7 * 86400
+SESSIONS = {}                    # login cookie -> expiry; a restart logs everyone out
+SESSIONS_LOCK = threading.Lock()
+FAILS = []                       # times of wrong passwords, to slow down guessing
+# The `dnsalsa` command in the container's shell proves itself with this file, readable only by the container user.
+CLI_TOKEN_FILES = (os.path.join(DATA, '.cli-token'), '/tmp/.dnsalsa-cli-token')   # /tmp when /data isn't writable
+CLI_TOKEN = secrets.token_urlsafe(32)
 LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1'} | {h.strip().lower() for h in os.environ.get('DNSALSA_HOSTS', '').split(',') if h.strip()}
 MISSES_BEFORE_REMOVE = 3   # lookups in a row without an address before its record goes
 
@@ -484,6 +493,9 @@ code{font:700 14px var(--mono);background:var(--bg);border:1px solid var(--line)
 .switch::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:var(--fg);transition:transform .15s}
 .switch:checked{background:var(--orange)}.switch:checked::after{transform:translateX(18px)}
 .switch:focus-visible,select:focus-visible{outline:2px solid var(--heat);outline-offset:2px}
+input[type=password]{font:500 14px var(--sans);padding:9px 12px;border-radius:9px;border:1px solid var(--line);background:var(--card2);color:var(--fg);width:100%}
+input[type=password]:focus-visible{outline:2px solid var(--heat);outline-offset:2px}
+.err{color:var(--heat);font-size:13px}
 select{font:500 14px var(--sans);padding:7px 10px;border-radius:9px;border:1px solid var(--line);background:var(--card2);color:var(--fg)}
 @media(prefers-reduced-motion:reduce){.switch,.switch::after{transition:none}}
 footer{margin-top:6px;text-align:center;font-size:12px;color:var(--muted)}footer a{color:var(--muted)}
@@ -504,7 +516,8 @@ schedule()}
 function bind(root){
 root.querySelectorAll('form[data-post]').forEach(f=>f.addEventListener('submit',async e=>{e.preventDefault();
 const b=f.querySelector('button');if(b)b.disabled=true;
-try{await fetch(f.dataset.post,{method:'POST',headers:{'X-DNSalsa':'1'},body:new URLSearchParams(new FormData(f))})}catch(e){}soft()}));
+try{const r=await fetch(f.dataset.post,{method:'POST',headers:{'X-DNSalsa':'1'},body:new URLSearchParams(new FormData(f))});
+const er=f.querySelector('[data-err]');if(!r.ok&&er){er.textContent=r.status===429?'Too many tries. Wait a minute.':'Wrong password.';if(b)b.disabled=false;return}}catch(e){}soft()}));
 // Settings save as soon as you flip a switch or pick an interval.
 root.querySelectorAll('form[data-auto]').forEach(f=>f.addEventListener('change',()=>f.requestSubmit()));
 // Copy also works on plain http:// (no secure context), where navigator.clipboard is missing.
@@ -645,9 +658,18 @@ def render_locked():
     body = '''<div class="card"><h2>Pairing code in the log</h2>
 <p>This page is open on your network, so it doesn't show the pairing code: anyone who enters that code in their own
 DNSalsa account decides where this connector sends traffic.</p>
-<ol><li>Find the code in the container log: <code>docker logs dnsalsa-connector</code>, or the app's logs in TrueNAS.</li>
-<li>Or set <code>DNSALSA_PASSWORD</code> for this container to use this page from your network.</li></ol></div>'''
+<ol><li>Run <code>dnsalsa code</code> in the container's shell: in TrueNAS under Apps, this app, Shell; with Docker
+<code>docker exec dnsalsa-connector dnsalsa code</code>. The code is also in the app's logs.</li>
+<li>Or set a password for this page (<code>DNSALSA_PASSWORD</code>) to use it from your network.</li></ol></div>'''
     return PAGE.replace('__PILL__', pill).replace('__BODY__', body).replace('__REFRESH__', ' data-refresh')
+
+
+def render_login():
+    body = '''<div class="card"><h2>Log in</h2>
+<form data-post="login" class="row"><label class="label" for="pw" style="width:100%">Password for this page</label>
+<input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
+<button type="submit" class="primary">Log in</button> <span class="err" data-err aria-live="polite"></span></form></div>'''
+    return PAGE.replace('__PILL__', '').replace('__BODY__', body).replace('__REFRESH__', '')
 
 
 def save_settings(form):
@@ -676,24 +698,45 @@ class Handler(BaseHTTPRequestHandler):
             return h[1:h.find(']')] if ']' in h else h
         return h.rsplit(':', 1)[0] if h.count(':') == 1 else h
 
+    def _cookie(self):
+        for part in (self.headers.get('Cookie') or '').split(';'):
+            k, _, v = part.strip().partition('=')
+            if k == 'dnsalsa_session':
+                return v
+        return ''
+
     def _trusted(self):
         """Who may see the pairing code and press the buttons; see PASSWORD."""
+        cli = self.headers.get('X-DNSalsa-Cli') or ''
+        if cli and hmac.compare_digest(cli.encode(), CLI_TOKEN.encode()):
+            return True
         if PASSWORD:
-            auth = self.headers.get('Authorization') or ''
-            if not auth.startswith('Basic '):
-                return False
-            try:
-                given = base64.b64decode(auth[6:], validate=True).decode('utf-8').split(':', 1)[1]
-            except Exception:  # noqa: BLE001  malformed header: not logged in
-                return False
-            return hmac.compare_digest(given.encode(), PASSWORD.encode())
+            token = self._cookie()
+            with SESSIONS_LOCK:
+                exp = SESSIONS.get(token)
+                if exp and exp < time.time():
+                    SESSIONS.pop(token, None)
+                    exp = None
+            return bool(token and exp)
         return self._host() in LOCAL_HOSTS
 
-    def _ask_login(self):
-        self.send_response(401)
-        self.send_header('WWW-Authenticate', 'Basic realm="DNSalsa connector", charset="UTF-8"')
-        self.send_header('Content-Length', '0')
-        self.end_headers()
+    def _login(self):
+        """One password, no username. Ten wrong ones in a minute and everyone waits a minute."""
+        now = time.time()
+        FAILS[:] = [t for t in FAILS if t > now - 60]
+        if len(FAILS) >= 10:
+            return self._send(429, '{"error":"slow_down"}', 'application/json')
+        form = urllib.parse.parse_qs(self.rfile.read(min(int(self.headers.get('Content-Length') or 0), 2000)).decode('utf-8', 'replace'))
+        given = (form.get('password') or [''])[0]
+        if not hmac.compare_digest(given.encode(), PASSWORD.encode()):
+            FAILS.append(now)
+            log('Wrong password on the page')
+            return self._send(401, '{"error":"wrong_password"}', 'application/json')
+        token = secrets.token_urlsafe(32)
+        with SESSIONS_LOCK:
+            SESSIONS[token] = now + SESSION_TTL
+        self._send(200, '{"ok":true}', 'application/json',
+                   cookie=f'dnsalsa_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}')
 
     def _allowed(self):
         """POSTs change things (unpair, settings): only from this page, never from another site. The X-DNSalsa header
@@ -701,14 +744,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == 'POST':
             origin = self.headers.get('Origin')
             host = self.headers.get('Host', '')
+            cli = self.headers.get('X-DNSalsa-Cli') or ''
+            if cli and hmac.compare_digest(cli.encode(), CLI_TOKEN.encode()):
+                return True   # the shell command: no browser, no Origin
             if (origin and origin.split('://', 1)[-1] != host) or self.headers.get('X-DNSalsa') != '1':
                 self.send_error(403)
                 return False
         return True
 
-    def _send(self, code, body, ctype='text/html; charset=utf-8'):
+    def _send(self, code, body, ctype='text/html; charset=utf-8', cookie=None):
         data = body.encode()
         self.send_response(code)
+        if cookie:
+            self.send_header('Set-Cookie', cookie)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
@@ -729,17 +777,24 @@ class Handler(BaseHTTPRequestHandler):
                                                    'service': STATE.service, 'homeAssistant': STATE.is_ha,
                                                    'proxyOk': STATE.proxy_ok, 'error': STATE.error}), 'application/json')
         if trusted:
-            return self._send(200, render())
-        if PASSWORD:
-            return self._ask_login()
-        self._send(200, render_locked())
+            page = render()
+            if PASSWORD:
+                page = page.replace('<footer>', '<form data-post="logout" class="row" style="justify-content:center"><button type="submit">Log out</button></form>\n<footer>', 1)
+            return self._send(200, page)
+        self._send(200, render_login() if PASSWORD else render_locked())
 
     def do_POST(self):
+        path = self.path.rstrip('/')
+        if path.endswith('login') and PASSWORD:
+            return self._login() if self._allowed() else None
         if not self._trusted():
-            return self._ask_login() if PASSWORD else self.send_error(403)
+            return self.send_error(403)
         if not self._allowed():
             return
-        path = self.path.rstrip('/')
+        if path.endswith('logout'):
+            with SESSIONS_LOCK:
+                SESSIONS.pop(self._cookie(), None)
+            return self._send(200, '{"ok":true}', 'application/json', cookie='dnsalsa_session=; Path=/; Max-Age=0')
         if path.endswith('check'):
             check_proxy()
         elif path.endswith('settings'):
@@ -751,8 +806,70 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, '{"ok":true}', 'application/json')
 
 
+CLI_HELP = '''Usage: dnsalsa <command>
+  code     the pairing code to enter on dnsalsa.nl
+  status   paired or not
+  unpair   forget the pairing and get a new code'''
+
+
+def cli(args):
+    """`dnsalsa code` and friends, in the container's shell. Asks the running connector over 127.0.0.1."""
+    cmd = args[0] if args else ''
+    if cmd not in ('code', 'status', 'unpair'):
+        print(CLI_HELP)
+        return 0 if cmd in ('', 'help', '-h', '--help') else 2
+    token = ''
+    for path in CLI_TOKEN_FILES:
+        try:
+            with open(path) as f:
+                token = f.read().strip()
+            break
+        except OSError:
+            continue
+    if not token:
+        print('The connector is not running in this container.', file=sys.stderr)
+        return 1
+
+    def call(path, post=False):
+        req = urllib.request.Request(f'http://127.0.0.1:{PORT}/{path}', data=b'' if post else None,
+                                     method='POST' if post else 'GET', headers={'X-DNSalsa-Cli': token})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r)
+    try:
+        if cmd == 'unpair':
+            call('unpair', post=True)
+            for _ in range(30):
+                time.sleep(0.5)
+                st = call('status')
+                if st.get('code'):
+                    break
+        else:
+            st = call('status')
+    except (OSError, ValueError) as e:
+        print(f'Could not reach the connector: {e}', file=sys.stderr)
+        return 1
+    if st.get('paired') and cmd != 'unpair':
+        print(f"Paired ({st.get('mode')})." + ('' if cmd == 'status' else ' Run "dnsalsa unpair" to pair again.'))
+        return 0
+    if st.get('code'):
+        print(st['code'] if cmd == 'code' else f"Not paired. Pairing code: {st['code']}")
+        if cmd != 'code':
+            print('Enter it on dnsalsa.nl under Setup within 15 minutes.')
+        return 0
+    print('No pairing code yet. Try again in a few seconds.' + (f" ({st['error']})" if st.get('error') else ''))
+    return 1
+
+
 def main():
     os.makedirs(DATA, exist_ok=True)
+    for path in CLI_TOKEN_FILES:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                f.write(CLI_TOKEN)
+            break
+        except OSError:
+            continue
     for fn in (pairing_loop, tunnel_loop, proxy_loop, ddns_loop):
         threading.Thread(target=fn, daemon=True).start()
     log(f'DNSalsa connector running, server {server()}. Status page on port {PORT}.')
@@ -760,4 +877,6 @@ def main():
 
 
 if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
     main()

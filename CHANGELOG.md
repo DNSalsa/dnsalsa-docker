@@ -3,8 +3,9 @@
 ## 1.2.0
 
 - Security: the page only shows the pairing code and the buttons to someone this machine trusts. Whoever enters that code in their own DNSalsa account decides where the connector sends traffic, so a code seen by someone else on your network could open your network to them.
-  - New `DNSALSA_PASSWORD`: with it, the page asks for that password (any username) and works from any address. Set it when the page is reachable from your network, as in the TrueNAS app.
-  - Without a password, only `localhost` and `127.0.0.1` (plus names in `DNSALSA_HOSTS`) get the code. Others see the state and a pointer to the container log, which still shows the code.
+  - New `DNSALSA_PASSWORD`: with it, the page shows a login with just that password and works from any device. Set it when you open the page from other devices, as in the TrueNAS app.
+  - Without a password, only `localhost` and `127.0.0.1` (plus names in `DNSALSA_HOSTS`) get the code. Other devices see the state but not the code.
+  - New `dnsalsa` command in the container: `dnsalsa code`, `dnsalsa status` and `dnsalsa unpair`. In TrueNAS: the app's Shell.
   - The page refuses requests for other host names, which stops DNS rebinding from a website, and buttons need a header that other sites can't send. The page can't be framed.
 
 ## 1.1.5

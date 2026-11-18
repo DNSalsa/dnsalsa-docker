@@ -384,16 +384,28 @@ class Requests(unittest.TestCase):
             s, _ = self.stub('GET', {'Host': host})
             self.assertFalse(main.Handler._trusted(s), f'{host}: LAN or DNS rebinding')
 
-    def test_password_lets_any_host_in_with_the_right_one(self):
-        import base64
+    def test_password_login_cookie_lets_any_host_in(self):
         main.PASSWORD = 'salsa-verde'
-        good = 'Basic ' + base64.b64encode(b'any:salsa-verde').decode()
-        bad = 'Basic ' + base64.b64encode(b'any:wrong').decode()
-        s, _ = self.stub('GET', {'Host': '192.168.1.5:8099', 'Authorization': good})
+        main.SESSIONS['good'] = time.time() + 60
+        main.SESSIONS['old'] = time.time() - 1
+        s, _ = self.stub('GET', {'Host': '192.168.1.5:8099', 'Cookie': 'x=1; dnsalsa_session=good'})
+        s._cookie = lambda: main.Handler._cookie(s)
         self.assertTrue(main.Handler._trusted(s))
-        for auth in (bad, 'Basic !!!', 'Bearer x', None):
-            s, _ = self.stub('GET', {'Host': '127.0.0.1:8099', **({'Authorization': auth} if auth else {})})
-            self.assertFalse(main.Handler._trusted(s), f'{auth}: localhost alone is not enough once a password is set')
+        for cookie in ('dnsalsa_session=old', 'dnsalsa_session=nope', ''):
+            s, _ = self.stub('GET', {'Host': '127.0.0.1:8099', 'Cookie': cookie})
+            s._cookie = lambda: main.Handler._cookie(s)
+            self.assertFalse(main.Handler._trusted(s), f'{cookie}: localhost alone is not enough once a password is set')
+        main.SESSIONS.clear()
+
+    def test_the_shell_command_is_trusted_by_its_token(self):
+        main.PASSWORD = 'salsa-verde'
+        s, _ = self.stub('POST', {'Host': '127.0.0.1:8099', 'X-DNSalsa-Cli': main.CLI_TOKEN})
+        self.assertTrue(main.Handler._trusted(s))
+        self.assertTrue(main.Handler._allowed(s))
+        s, sent = self.stub('POST', {'Host': '127.0.0.1:8099', 'X-DNSalsa-Cli': 'guess', 'Origin': 'https://evil.example'})
+        s._cookie = lambda: ''
+        self.assertFalse(main.Handler._trusted(s))
+        self.assertFalse(main.Handler._allowed(s))
 
     def test_another_site_cannot_unpair(self):
         s, sent = self.stub('POST', {'Host': '127.0.0.1:8099', 'Origin': 'https://evil.example', 'X-DNSalsa': '1'})
@@ -429,7 +441,7 @@ class LanPage(unittest.TestCase):
         for host in ('192.168.1.5:8099', 'evil.example:8099'):
             _, page, headers = self.get('/', host)
             self.assertNotIn('K7QP-4XM2', page)
-            self.assertIn('docker logs dnsalsa-connector', page)
+            self.assertIn('dnsalsa code', page)
             self.assertNotIn('<form', page, 'no buttons')
             self.assertEqual(headers['X-Frame-Options'], 'DENY')
             _, status, _ = self.get('/status', host)
@@ -450,18 +462,67 @@ class LanPage(unittest.TestCase):
         finally:
             main.STATE.forget()
 
-    def test_password_asks_for_login(self):
-        import base64
+    def post(self, path, body, headers):
+        import urllib.request
+        req = urllib.request.Request(self.url + path, data=body, method='POST', headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode(), r.headers
+
+    def test_password_page_logs_in_with_just_a_password(self):
         main.PASSWORD = 'salsa-verde'
+        main.FAILS.clear()
+        _, page, _ = self.get('/', '192.168.1.5:8099')
+        self.assertIn('type="password"', page)
+        self.assertNotIn('K7QP-4XM2', page)
+        self.assertNotIn('username', page.lower())
+        hdr = {'Host': '192.168.1.5:8099', 'X-DNSalsa': '1', 'Content-Type': 'application/x-www-form-urlencoded'}
         with self.assertRaises(urllib.error.HTTPError) as e:
-            self.get('/', '192.168.1.5:8099')
+            self.post('/login', b'password=wrong', hdr)
         self.assertEqual(e.exception.code, 401)
-        self.assertIn('Basic', e.exception.headers['WWW-Authenticate'])
-        auth = 'Basic ' + base64.b64encode(b'x:salsa-verde').decode()
-        _, page, _ = self.get('/', '192.168.1.5:8099', {'Authorization': auth})
+        _, _, headers = self.post('/login', b'password=salsa-verde', hdr)
+        cookie = headers['Set-Cookie']
+        self.assertIn('HttpOnly', cookie)
+        self.assertIn('SameSite=Strict', cookie)
+        _, page, _ = self.get('/', '192.168.1.5:8099', {'Cookie': cookie.split(';')[0]})
         self.assertIn('K7QP-4XM2', page)
+        self.assertIn('Log out', page)
         _, status, _ = self.get('/status', '192.168.1.5:8099')
         self.assertIsNone(json.loads(status)['code'])
+        main.SESSIONS.clear()
+
+    def test_wrong_passwords_slow_down(self):
+        main.PASSWORD = 'salsa-verde'
+        main.FAILS.clear()
+        hdr = {'Host': '192.168.1.5:8099', 'X-DNSalsa': '1'}
+        codes = []
+        for _ in range(11):
+            try:
+                self.post('/login', b'password=nope', hdr)
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+        self.assertEqual(codes[:10], [401] * 10)
+        self.assertEqual(codes[10], 429)
+        main.FAILS.clear()
+
+    def test_shell_command_prints_the_code(self):
+        import io, contextlib, tempfile
+        port = int(self.url.rsplit(':', 1)[1])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, '.cli-token')
+            with open(path, 'w') as f:
+                f.write(main.CLI_TOKEN)
+            old = (main.CLI_TOKEN_FILES, main.PORT)
+            main.CLI_TOKEN_FILES, main.PORT = (path,), port
+            main.PASSWORD = 'salsa-verde'
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(main.cli(['code']), 0)
+                self.assertEqual(out.getvalue().strip(), 'K7QP-4XM2')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main.cli(['bogus']), 2)
+            finally:
+                main.CLI_TOKEN_FILES, main.PORT = old
 
 
 class Release(unittest.TestCase):
