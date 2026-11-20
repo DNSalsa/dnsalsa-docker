@@ -8,3 +8,4 @@
 - **Tests:** `python3 -m unittest discover -s tests` (standard library only). GitHub Actions runs them on every push and pull request, and builds and starts the image.
 - **Run without Docker:** `DNSALSA_DATA=/tmp/d DNSALSA_SERVER=https://staging.dnsalsa.nl python3 app/main.py`, then open http://127.0.0.1:8099.
 - **Pairing API:** `POST /api/pair/start` with `kind: "connector"` and `ddns: true`, then `/api/pair/poll`; the dashboard claims the code with the route, or with `mode: "ddns"` for dynamic DNS (the poll then returns an update token). See the README of `DNSalsa/dnsalsa`.
+- **Replaced tunnels:** `POST /api/tunnel/refresh` with the hostname and the current token, every 6 hours and soon after cloudflared stops or can't connect. A 404 (a DNSalsa server without it) or 403 changes nothing. The `User-Agent` carries the version for the admin overview; a test keeps it equal to the release version.

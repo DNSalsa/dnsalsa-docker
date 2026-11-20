@@ -182,6 +182,60 @@ class Pairing(unittest.TestCase):
             main.STATE.forget()
 
 
+class FakeRefresh(BaseHTTPRequestHandler):
+    calls = []
+    answer = (200, {'changed': False})
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get('Content-Length') or 0)) or b'{}')
+        FakeRefresh.calls.append((self.path, self.headers.get('User-Agent'), body))
+        status, out = FakeRefresh.answer
+        data = json.dumps(out).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class ReplacedTunnel(unittest.TestCase):
+    def setUp(self):
+        self.url, self.srv = serve(FakeRefresh)
+        FakeRefresh.calls = []
+        os.environ['DNSALSA_SERVER'] = self.url
+        main.STATE.forget()
+        main.STATE.save({'mode': 'tunnel', 'token': 'tok-old', 'hostname': 'jansen.dnsalsa.nl', 'url': 'https://jansen.dnsalsa.nl', 'service': 'http://x:1'})
+
+    def tearDown(self):
+        os.environ.pop('DNSALSA_SERVER', None)
+        stop(self.srv)
+        main.STATE.forget()
+
+    def test_new_token_is_saved_and_cloudflared_restarts(self):
+        FakeRefresh.answer = (200, {'changed': True, 'token': 'tok-new', 'hostname': 'jansen.dnsalsa.nl'})
+        self.assertTrue(main.tunnel_refresh())
+        path, agent, body = FakeRefresh.calls[0]
+        self.assertEqual(path, '/api/tunnel/refresh')
+        self.assertEqual(body, {'hostname': 'jansen.dnsalsa.nl', 'token': 'tok-old'})
+        self.assertEqual(agent, main.USER_AGENT, 'DNSalsa shows this version to the admin')
+        self.assertEqual(main.STATE.saved['token'], 'tok-new')
+        self.assertEqual(main.State()._load()['token'], 'tok-new', 'survives a restart')
+        self.assertEqual(main.STATE.saved['service'], 'http://x:1', 'the rest of the pairing stays')
+
+    def test_unchanged_or_refused_leaves_the_pairing_alone(self):
+        for answer in [(200, {'changed': False}), (403, {'error': 'forbidden'}), (404, {})]:
+            FakeRefresh.answer = answer
+            self.assertFalse(main.tunnel_refresh())
+            self.assertEqual(main.STATE.saved['token'], 'tok-old')
+
+    def test_dynamic_dns_pairing_never_asks(self):
+        main.STATE.save({'mode': 'ddns', 'token': 'dsa_x', 'hostname': 'jansen.dnsalsa.nl', 'url': 'https://jansen.dnsalsa.nl'})
+        self.assertFalse(main.tunnel_refresh())
+        self.assertEqual(FakeRefresh.calls, [])
+
+
 class FakeUpdate(BaseHTTPRequestHandler):
     """DNSalsa's /api/ip and /api/update."""
     my_ip = '84.26.113.7'
@@ -396,6 +450,7 @@ class Release(unittest.TestCase):
         self.assertRegex(version, r'^\d+\.\d+\.\d+$')
         first = re.search(r'^## ([\d.]+)', self.read('CHANGELOG.md'), re.M).group(1)
         self.assertEqual(version, first, 'raise VERSION and add a CHANGELOG entry together')
+        self.assertEqual(main.USER_AGENT, f'dnsalsa-connector/{version}', 'DNSalsa shows this version to the admin')
 
     def test_cloudflared_pinned_with_checksums(self):
         dockerfile = self.read('Dockerfile')
