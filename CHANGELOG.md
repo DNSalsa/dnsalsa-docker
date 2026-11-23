@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.7
+
+- cloudflared 2026.11.2.
+
 ## 1.1.6
 
 - cloudflared 2026.11.1.

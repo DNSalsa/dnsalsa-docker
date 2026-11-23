@@ -6,12 +6,12 @@ FROM alpine:3.23
 ARG TARGETARCH
 # cloudflared from Cloudflare's GitHub releases, checked against a pinned checksum.
 # Updated by .github/workflows/cloudflared.yml (a pull request every time Cloudflare releases a new version).
-ARG CLOUDFLARED_VERSION=2026.11.1
+ARG CLOUDFLARED_VERSION=2026.11.2
 
 RUN apk add --no-cache python3 ca-certificates curl \
  && case "${TARGETARCH}" in \
-      amd64) ARCH=amd64; SUM=97bb3b02d23a5980fc9c15a1a270e692da1923f103f920d5b16d4931d5ab55e7 ;; \
-      arm64) ARCH=arm64; SUM=b155cec3e48e489cfb8e5c602769fb8c771083018d8881d68b4d18a791567c5a ;; \
+      amd64) ARCH=amd64; SUM=56f13335143ec0e22772963290683a84a04114a35ec64cbc794a4d39ff9bb8cf ;; \
+      arm64) ARCH=arm64; SUM=04a7b7f08bce85d56b26ffe1fdbfbb21a074495a363d16f0783c40e25b5c5281 ;; \
       *) echo "Unsupported architecture: ${TARGETARCH}"; exit 1 ;; \
     esac \
  && curl -fsSL -o /usr/local/bin/cloudflared \
