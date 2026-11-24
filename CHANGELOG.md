@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.0
+
+- Picks up a replaced tunnel by itself. When DNSalsa gives your tunnel a new token (for example when it moves to another Cloudflare account), the connector fetches the new token and restarts cloudflared, so you don't have to pair again. It checks every few hours, and soon after cloudflared stops.
+- Sends its version to DNSalsa, so support can see which connector you run.
+
 ## 1.1.7
 
 - cloudflared 2026.11.2.
